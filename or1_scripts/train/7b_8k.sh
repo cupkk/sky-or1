@@ -1,6 +1,13 @@
 #!/bin/bash
 set -ex
 
+# 中文学习提示：
+# 这是 Skywork-OR1-7B 的 8K 回复长度训练脚本，也是最适合新手先读懂的一条主线。
+# 它没有把训练逻辑写在 bash 里，而是通过 Hydra 覆盖参数启动：
+#   python3 -m verl.trainer.main_ppo
+# 真正的训练循环在 verl/trainer/ppo/ray_trainer.py。
+
+# Ray / torch distributed 的基础环境变量。单机时默认 WORLD_SIZE=1、RANK=0。
 export WORLD_SIZE=${WORLD_SIZE:-1}
 export RANK=${RANK:-0}
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -9,6 +16,8 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
 
 # Entropy Config
+# 熵正则用于防止模型过早变得“太确定”，也就是技术报告里讨论的 entropy collapse。
+# Skywork 这里启用自适应熵系数：当前熵低于目标值时增大 entropy coefficient。
 ENTROPY_COEFF=0.0
 USE_ADAPTIVE_ENT=True
 TGT_ENTROPY=0.2
@@ -16,6 +25,9 @@ MAX_ENT_COEF=0.005
 MIN_ENT_COEF=0
 DELTA_ENT_COEF=0.0001
 
+# ROLLOUT_BATCH_SIZE 是每步抽取多少个 prompt。
+# GROUP_SIZE=16 表示每个 prompt 采样 16 条回答，这是 GRPO 的关键：
+# 同一个题目下多条回答互相比较，奖励有高有低才有训练信号。
 ROLLOUT_BATCH_SIZE=256
 PPO_MINI_BATCH=256
 MAX_PROMPT_LENGTH=2048
@@ -23,13 +35,18 @@ RES_LENGTH=8192
 GROUP_SIZE=16
 N_VAL_SAMPLES=8
 
+# 训练采样温度。温度越高，采样越发散；GRPO 需要一定多样性，但太高会降低可学习性。
 TRAIN_TEMPERATURE=1.0
 
+# TP 是 vLLM 推理侧 tensor parallel size。
+# SP 是 Ulysses sequence parallel size，长上下文训练时用于切分序列维。
 TP=1
 SP=1
 MAX_TOKEN_LEN=$(((RES_LENGTH + MAX_PROMPT_LENGTH + 1000) / SP))
 
 # Your Model Path
+# MODEL_PATH 通常指向 DeepSeek-R1-Distill-Qwen-7B 或继续训练得到的 checkpoint。
+# CODE_PATH 指向当前仓库根目录，脚本通过它找到 or1_data、保存 verl_ckpt。
 MODEL_PATH=${MODEL_PATH:-}
 CODE_PATH=${CODE_PATH:-}
 if [ -z "$MODEL_PATH" ]; then
@@ -42,6 +59,8 @@ if [ -z "$CODE_PATH" ]; then
 fi
 
 # Since math queries are much more than code queries, we duplicate the math data when mixing the datasets
+# README 这句英文和实际脚本不完全一致：这里重复的是 code 数据两次，再加 math 一次。
+# 目的都是调节 math/code 混合比例，让代码样本在训练 batch 中有足够权重。
 train_files="[\"$CODE_PATH/or1_data/train/train_7b_code.pkl\",\"$CODE_PATH/or1_data/train/train_7b_code.pkl\",\"$CODE_PATH/or1_data/train/train_7b_math.pkl\"]"
 test_files="[\"$CODE_PATH/or1_data/eval/aime24.parquet\",\"$CODE_PATH/or1_data/eval/aime25.parquet\"]"
 
@@ -57,6 +76,14 @@ mkdir -p $SAVE_STATS_DIR
 
 export RAY_DEBUG=1
 
+# 下面所有 key=value 都是 Hydra 覆盖项，会覆盖 verl/trainer/config/ppo_trainer.yaml。
+# 新手读代码时建议按这个顺序追踪：
+# 1. main_ppo.py 读取配置并创建 RayPPOTrainer；
+# 2. ray_trainer.py 用 data.train_files 创建 RLHFDataset；
+# 3. ActorRolloutRefWorker 用 vLLM 生成 GROUP_SIZE 条回答；
+# 4. YRRewardManager 调 verifier 得到奖励；
+# 5. core_algos.compute_grpo_outcome_advantage 计算 advantage；
+# 6. update_actor 做 PPO-style policy update。
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$train_files \
@@ -110,4 +137,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=30 "${@:1}"
-    

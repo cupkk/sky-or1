@@ -73,6 +73,16 @@ class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
     or a hybrid engine based on the config.rollout
+
+    中文学习提示：
+    这个 worker 是 FSDP 路线下最重要的执行单元。
+    它可以同时承担三种角色：
+    - actor：被 RL 更新的策略模型；
+    - rollout：用当前 actor 权重生成回答；
+    - ref：冻结的参考策略，用来计算 KL penalty。
+
+    Skywork 默认 hybrid_engine=True，会尽量把这些角色合在一个 worker 里，
+    通过 sharding/offload 在训练和推理之间切换，减少大模型权重复制成本。
     """
 
     def __init__(self, config: DictConfig, role: str):
@@ -101,6 +111,7 @@ class ActorRolloutRefWorker(Worker):
         self.role = role
         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
 
+        # 根据 role 打开对应能力。actor_rollout_ref 表示三种能力都具备。
         self._is_actor = self.role in ['actor', 'actor_rollout', 'actor_rollout_ref']
         self._is_rollout = self.role in ['rollout', 'actor_rollout', 'actor_rollout_ref']
         self._is_ref = self.role in ['ref', 'actor_rollout_ref']
@@ -155,6 +166,8 @@ class ActorRolloutRefWorker(Worker):
 
         assert role in ['actor', 'ref']
 
+        # 从 HF checkpoint 加载 causal LM。
+        # actor 用 float32 初始化是为了训练稳定；ref 只算 logprob，可用 bf16 降低显存。
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
         local_path = copy_local_path_from_hdfs(model_path)
 
@@ -209,8 +222,8 @@ class ActorRolloutRefWorker(Worker):
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
-            if enable_gradient_checkpointing:
-                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        if enable_gradient_checkpointing:
+            actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -218,6 +231,8 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
+        # FSDP 会把模型参数分片到多个 GPU，降低单卡显存。
+        # 这里 rollout 也包 FSDP，是为了训练权重和生成权重能在同一套分片体系里同步。
         # We wrap FSDP for rollout as well
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
         if mixed_precision_config is not None:
@@ -243,6 +258,8 @@ class ActorRolloutRefWorker(Worker):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
+        # ref 是冻结模型，只参与 KL logprob 计算，因此可以更激进地 CPU offload 省显存。
+        # actor 要反向传播和梯度累积，CPUOffload 可能引入正确性/性能问题。
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == 'actor' else CPUOffload(offload_params=True)
@@ -303,6 +320,7 @@ class ActorRolloutRefWorker(Worker):
             from verl.workers.rollout.vllm_rollout import vLLMRollout
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
             log_gpu_memory_usage('Before building vllm rollout', logger=None)
+            # vLLMRollout 负责高吞吐采样；FSDPVLLMShardingManager 负责把 FSDP actor 权重同步给 vLLM。
             rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                   config=self.config.rollout,
                                   tokenizer=self.tokenizer,
@@ -369,9 +387,11 @@ class ActorRolloutRefWorker(Worker):
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            # 生成组件在 actor 模型初始化后建立，这样它能拿到当前策略权重。
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
+            # 参考模型独立加载，训练过程中不更新，用来计算 KL penalty。
             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
                                                                fsdp_config=self.config.ref.fsdp_config,
                                                                optim_config=None,
@@ -397,6 +417,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        """在 worker 上执行 PPO policy update。"""
         data = data.to('cuda')
 
         assert self._is_actor
@@ -415,6 +436,7 @@ class ActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
+                # DataParallelPPOActor.update_policy 内部会使用 advantages、old_log_probs 等计算 PPO loss。
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
@@ -442,6 +464,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        """用当前 actor 权重生成 response。训练 rollout 和离线评测都会调用这里。"""
         prompts = prompts.to('cuda')
 
         assert self._is_rollout
@@ -461,6 +484,8 @@ class ActorRolloutRefWorker(Worker):
         }
         prompts.meta_info.update(meta_info)
         with self.rollout_sharding_manager:
+            # 进入 context 时把训练侧 FSDP 权重准备给 vLLM；
+            # 退出 context 时恢复训练侧分片/释放推理侧临时状态。
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
@@ -482,6 +507,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
+        """用 actor 重新计算生成回答的 token log probability。"""
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
@@ -519,6 +545,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
+        """用冻结参考策略计算 token log probability，供 KL penalty 使用。"""
         assert self._is_ref
 
         data = data.to('cuda')

@@ -49,12 +49,22 @@ from vllm import SamplingParams
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
     # remove the left padding in the prompt token_id
     # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
+    # 中文解释：训练数据为了 batch 对齐做了 left padding；
+    # vLLM 接收每条 prompt 的真实 token list，所以这里去掉左侧 pad。
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
 
 class vLLMRollout(BaseRollout):
+    """用 vLLM 执行 rollout 生成。
+
+    中文学习提示：
+    在 RLHF/RLVR 训练里，rollout 指“当前策略模型面对 prompt 采样回答”。
+    Skywork-OR1 用 vLLM 而不是 transformers.generate，主要是为了长输出、多采样和高吞吐。
+
+    这个类只负责生成，不负责训练梯度；训练梯度在 actor.update_policy 中完成。
+    """
 
     def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
@@ -89,6 +99,8 @@ class vLLMRollout(BaseRollout):
 
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
+        # LLM 这里是 verl.third_party.vllm 包装后的入口。
+        # actor_module 是当前训练中的策略模型，sharding_manager 会在生成前把 FSDP 权重同步给 vLLM。
         self.inference_engine = LLM(
             actor_module,
             tokenizer=tokenizer,
@@ -106,6 +118,7 @@ class vLLMRollout(BaseRollout):
         )
 
         # Offload vllm model to reduce peak memory usage
+        # 训练和生成共用 GPU 时显存压力很大，生成完可把 vLLM 权重 offload 掉降低峰值显存。
         self.inference_engine.offload_model_weights()
 
         kwargs = dict(
@@ -130,6 +143,11 @@ class vLLMRollout(BaseRollout):
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
+        """临时修改采样参数，用完恢复。
+
+        例如验证阶段可以把 temperature 改成 val_temperature，
+        ReMax baseline 可以临时改成 greedy decoding。
+        """
         # update sampling params
         old_sampling_params_args = {}
         if kwargs:
@@ -149,6 +167,7 @@ class vLLMRollout(BaseRollout):
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
         if self.config.free_cache_engine:
+            # 每次 rollout 前重建 KV cache engine，生成后释放，避免训练显存被长期占用。
             torch.cuda.empty_cache()
             self.inference_engine.init_cache_engine()
 
@@ -190,6 +209,8 @@ class vLLMRollout(BaseRollout):
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+        # response 是生成 token；log_probs 是 vLLM 侧顺手算的 token logprob。
+        # 训练主循环后面仍会用 actor 重新计算 old_log_probs，保证精确对齐训练模型。
         response = output[0].to(idx.device)
         log_probs = output[1].to(idx.device)
 
@@ -198,6 +219,7 @@ class vLLMRollout(BaseRollout):
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
 
         if self.config.n > 1 and do_sample:
+            # 每个 prompt 采样 n 条 response，所以 prompt 相关张量也要 repeat_interleave 到同样行数。
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
@@ -231,6 +253,7 @@ class vLLMRollout(BaseRollout):
 
         # free vllm cache engine
         if self.config.free_cache_engine:
+            # 释放 vLLM KV cache，把显存还给后续 logprob/actor update。
             torch.cuda.empty_cache()
             self.inference_engine.free_cache_engine()
 

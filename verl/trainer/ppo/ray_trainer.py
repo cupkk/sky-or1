@@ -104,6 +104,16 @@ from verl.utils.torch_functional import masked_mean
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+    """把 verifier / reward model 得分转换成带 KL 惩罚的 token-level reward。
+
+    中文解释：
+    - token_level_scores 是外部奖励，Skywork-OR1 里通常来自数学/代码 verifier；
+    - old_log_probs 是当前 actor 生成这批回答时的 log probability；
+    - ref_log_prob 是参考策略对同一批回答的 log probability；
+    - KL 惩罚会扣掉“新策略偏离参考策略太远”的部分。
+
+    如果没有 reference policy，就不扣 KL，直接把 scores 当 rewards。
+    """
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -136,6 +146,12 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    """根据配置选择 advantage 估计方法。
+
+    中文解释：
+    Skywork 训练脚本设置 algorithm.adv_estimator=grpo，所以主要走 grpo 分支。
+    GAE 需要 critic/value model；GRPO 不需要 critic，而是利用同一 prompt 的多次采样做组内相对比较。
+    """
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -339,6 +355,16 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
+
+    中文学习提示：
+    这个类是训练总控。它本身不直接在 GPU 上跑大模型 forward/backward，
+    而是通过 RayWorkerGroup 远程调用 worker：
+    - actor_rollout_wg.generate_sequences: 用 vLLM 生成回答；
+    - actor_rollout_wg.compute_log_prob: 重新计算 actor logprob；
+    - ref_policy_wg.compute_ref_log_prob: 计算参考策略 logprob；
+    - actor_rollout_wg.update_actor: 执行 PPO policy update。
+
+    你可以把它理解成“RL 数据流编排器”。
     """
 
     # TODO: support each role have individual ray_worker_group_cls,
@@ -493,6 +519,8 @@ class RayPPOTrainer(object):
     def _create_dataloader(self):
         from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
         # TODO: we have to make sure the batch size is divisible by the dp size
+        # RLHFDataset 会读取 pkl/parquet，把 prompt 套 chat_template 后 tokenize。
+        # non_tensor 字段（reward_model、ability、extra_info）会原样保留给 reward manager 使用。
         self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
                                          tokenizer=self.tokenizer,
                                          prompt_key=self.config.data.prompt_key,
@@ -503,6 +531,8 @@ class RayPPOTrainer(object):
 
         train_batch_size = self.config.data.train_batch_size
         if self.config.trainer.rejection_sample:
+            # rejection sampling 会丢弃全对/全错 prompt 组。
+            # 如果丢弃过多，可以先放大原始 batch，再筛选出有训练信号的样本。
             train_batch_size *= self.config.trainer.rejection_sample_multiplier
             train_batch_size = int(train_batch_size)
 
@@ -931,6 +961,16 @@ class RayPPOTrainer(object):
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
+
+        中文训练流程速记：
+        1. 从 dataloader 取一批 prompt；
+        2. rollout worker 对每个 prompt 采样 n 条 response；
+        3. reward_fn 调 verifier 得到 token_level_scores；
+        4. GRPO 可选丢弃全对/全错 prompt 组；
+        5. 重新计算 old_log_probs 和 ref_log_prob；
+        6. 加 KL penalty 得到 token_level_rewards；
+        7. compute_advantage 得到 advantages/returns；
+        8. update_actor 用 PPO loss 更新策略模型。
         """
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
@@ -967,6 +1007,8 @@ class RayPPOTrainer(object):
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
+                # 生成阶段只需要 input_ids/attention_mask/position_ids。
+                # reward_model、ability、extra_info 等非张量字段先留在 batch 里，生成后再 union 回来用于打分。
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=False)
                 gen_batch.meta_info = {
@@ -976,6 +1018,8 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        # 对每个 prompt 采样 rollout.n 条 response。
+                        # 在 Skywork 7B 脚本中 rollout.n=GROUP_SIZE=16。
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         indices = torch.arange(len(gen_batch_output)).reshape(self.config.actor_rollout_ref.rollout.n, -1).T.reshape(-1)
                         gen_batch_output.reorder(indices)
@@ -1012,6 +1056,9 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
+                        # Skywork-OR1 默认主要使用 rule-based reward：
+                        # 数学题比较最终答案，代码题执行测试用例。reward_tensor 形状是 (bs*n, response_len)，
+                        # 通常只有每条 response 的最后一个有效 token 上放 0/1 或连续奖励。
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
 
@@ -1020,6 +1067,8 @@ class RayPPOTrainer(object):
                             # Rejection sampling based on rewards
                             # Rejection sampling based on rewards
                             # Group rewards by uid
+                            # GRPO 依赖同一 prompt 的多条回答之间存在差异。
+                            # 如果某个 prompt 的 16 条回答全错或全对，组内标准化后几乎没有有效学习信号。
                             uids = batch.non_tensor_batch['uid']
                             unique_uids = np.unique(uids)
                             valid_mask = torch.ones(len(uids), dtype=torch.bool)
@@ -1098,12 +1147,15 @@ class RayPPOTrainer(object):
 
                         # recompute old_log_probs
                         with _timer('old_log_prob', timing_raw):
+                            # vLLM 生成时得到的 logprob 不一定直接适合训练，
+                            # 这里用 actor 训练模型重新算一遍，保证 loss 用的是当前策略的精确 logprob。
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             batch = batch.union(old_log_prob)
 
                         if self.use_reference_policy:
                             # compute reference log_prob
                             with _timer('ref', timing_raw):
+                                # 参考策略通常是初始模型，用于 KL penalty，防止 RL 后模型偏离太远。
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
 
@@ -1115,6 +1167,8 @@ class RayPPOTrainer(object):
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                            # token_level_scores 是 verifier 原始得分；
+                            # token_level_rewards 是扣除 KL 后真正进入 advantage 计算的奖励。
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
@@ -1123,6 +1177,7 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        # Skywork 默认走 GRPO：同题多采样的奖励做组内归一化，得到每条 response 的相对优势。
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
@@ -1148,6 +1203,7 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
+                            # 真正的梯度更新发生在 worker 内部的 DataParallelPPOActor.update_policy。
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)

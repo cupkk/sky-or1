@@ -13,6 +13,14 @@
 # limitations under the License.
 """
 Generate responses given a dataset of prompts
+
+中文学习提示：
+这是离线生成/评测入口，eval_7b.sh 和 eval_32b.sh 会调用它。
+它做两件事：
+1. 对评测集每道题采样 n_samples 条回答；
+2. 调用同一套 verifier 给回答打分，汇总 Pass@1 / Pass@K / Avg@K 风格指标。
+
+训练和评测共用很多组件：tokenizer、ActorRolloutRefWorker、vLLM rollout、YRRewardManager 的并行打分函数。
 """
 import csv
 import ray
@@ -55,6 +63,7 @@ def main(config):
     # tokenizer.model_max_length = 32768
     # Check if output file already exists
     if os.path.exists(config.data.output_path):
+        # 如果已经生成过 pkl，就直接读取并重新评测，避免重复跑昂贵的模型生成。
         print(f"Output file {config.data.output_path} already exists. Skipping generation and proceeding to evaluation.")
         if config.data.output_path.endswith(".pkl"):
             dataset = pd.read_pickle(config.data.output_path)
@@ -104,6 +113,8 @@ def main(config):
             batch_chat_lst = chat_lst[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
             
             # Repeat the batch n_samples times
+            # 评测 Avg@K / Pass@K 的关键：同一道题重复采样 K 次。
+            # AIME 默认 n_samples=32，LiveCodeBench 默认 n_samples=4。
             repeated_chat_lst = []
             for chat in batch_chat_lst:
                 repeated_chat_lst.extend([chat] * config.data.n_samples)
@@ -127,6 +138,8 @@ def main(config):
             real_batch_size = data.batch['input_ids'].shape[0]
             
             if real_batch_size % dp_size != 0 or real_batch_size % wg.world_size != 0:
+                # Ray/vLLM 分布式推理要求 batch 能被并行度整除。
+                # 不整除时复制少量 dummy 样本补齐，生成后再裁掉。
                 lcm_value = math.lcm(dp_size, wg.world_size)
                 adjusted_batch_size = (real_batch_size // lcm_value + 1) * lcm_value
                 dummy_data_size = adjusted_batch_size - real_batch_size
@@ -158,6 +171,7 @@ def main(config):
             output_lst.extend(output_text_unpad)
 
         # Reshape output_lst from (total_samples,) to (n_data, n_samples)
+        # 保存形状为：每道题一个列表，列表里有 n_samples 条 response。
         total_samples = len(output_lst)
         n_data = total_samples // config.data.n_samples
         output_lst = np.array(output_lst).reshape(n_data, config.data.n_samples).tolist()
@@ -184,6 +198,7 @@ def main(config):
     }
     
     compute_score_yr_with_args = partial(compute_score_yr, is_binary_reward=False)
+    # 展平所有 response 后并行打分，再 reshape 回 (题目数, n_samples)。
     scores = parallel_compute_score(
         compute_score_yr_with_args,
         [x for xx in dataset['responses'] for x in xx],

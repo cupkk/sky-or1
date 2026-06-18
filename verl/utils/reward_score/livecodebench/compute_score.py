@@ -55,7 +55,7 @@ def timeout_run(seconds):
     def signal_handler(signum, frame):
         raise TimeoutError("代码执行超时")
     
-    # 注册信号处理器
+    # 注册信号处理器；注意 signal.alarm 主要适用于 Linux，Windows 下不适合直接跑代码评测。
     signal.signal(signal.SIGALRM, signal_handler)
     signal.alarm(seconds)
     
@@ -65,11 +65,21 @@ def timeout_run(seconds):
         signal.alarm(0)
 
 def convert_function_to_class_method(raw_code: str, function_name: str) -> str:
-    # 解析原始代码为 AST
+    """把裸函数改造成 LeetCode 风格的 Solution 类方法。
+
+    中文解释：
+    一些代码题期望提交格式是：
+        class Solution:
+            def twoSum(...)
+    但模型可能只输出：
+        def twoSum(...)
+    这里用 AST 找到目标函数，并自动包一层 Solution 类。
+    """
+    # 解析原始代码为 AST，比字符串拼接更稳。
     tree = ast.parse(raw_code)
     target_func = None
     new_body = []
-    # 遍历顶层节点，保留非目标函数的代码
+    # 遍历顶层节点，保留非目标函数的代码。
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == function_name:
             target_func = node
@@ -93,12 +103,19 @@ def convert_function_to_class_method(raw_code: str, function_name: str) -> str:
     new_body.append(class_def)
     tree.body = new_body
     
-    # 使用 ast.unparse 将 AST 转换为代码字符串（Python 3.9+支持）
+    # 使用 ast.unparse 将 AST 转换为代码字符串（Python 3.9+ 支持）。
     new_code = ast.unparse(tree)
     return new_code
 
 
 def math_verify_reward_function(solution_str, ground_truth):
+    """数学题 verifier。
+
+    它先用 math_verify.parse 解析模型答案，再做两级判断：
+    1. 快速字符串匹配；
+    2. 用 verify 做语义等价判断，例如分数、小数、boxed 表达式等。
+    返回 1.0 表示正确，0.0 表示错误。
+    """
 
     ground_truth = [ground_truth] if isinstance(ground_truth, str) else ground_truth
     
@@ -134,6 +151,17 @@ def math_verify_reward_function(solution_str, ground_truth):
 
 
 def compute_score(completion, test_cases, task=None, timeout=6, is_long_penalty=False, is_binary_reward=True, is_power4_reward=False):
+    """统一 reward 入口：根据 test_cases 的结构自动判断数学题还是代码题。
+
+    中文分支说明：
+    - test_cases 包含 question_id：LiveCodeBench 官方题目，读取对应 pkl benchmark；
+    - test_cases 包含 import_prefix：带自定义测试模板的函数题；
+    - test_cases 包含 inputs：输入输出样例题，调用 check_correctness；
+    - test_cases 包含 assert_case：直接拼接 assert 单测执行；
+    - 其他情况：按数学题处理，调用 math_verify_reward_function。
+
+    completion 是模型完整输出。若包含 </think>，只取 </think> 后面的最终答案/代码。
+    """
     # try to get code solution from completion. if the completion is pure code, this will not take effect.
     # solution = completion.split('```python')[-1].split('```')[0]
 
@@ -178,7 +206,7 @@ def compute_score(completion, test_cases, task=None, timeout=6, is_long_penalty=
                 cur_solution += "\ncheck({})".format(test_cases['entry_point'])
 
                 try:
-                    # 执行代码的逻辑
+                    # 执行模型生成代码并观察单测是否通过。
                     success = False
                     message = None
                     with timeout_run(seconds=2):
@@ -294,7 +322,7 @@ def compute_score(completion, test_cases, task=None, timeout=6, is_long_penalty=
                 cur_solution = IMPORT_PROMPT + cur_solution
 
                 try:
-                    # 执行代码的逻辑
+                    # 执行模型生成代码并观察 assert 是否全部通过。
                     success = False
                     message = None
                     with timeout_run(seconds=2):

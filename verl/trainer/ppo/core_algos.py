@@ -16,6 +16,14 @@
 Core functions to implement PPO algorithms.
 The function implemented in this file should be used by trainer with different distributed strategies to
 implement PPO
+
+中文学习提示：
+这个文件放的是强化学习算法的“数学核心”，不关心 Ray/FSDP/vLLM 这些工程细节。
+面试时建议重点讲清楚四件事：
+1. KL controller：约束新策略不要偏离参考策略太远；
+2. GRPO advantage：同一个 prompt 采样多条回答，按组做相对归一化；
+3. PPO policy loss：用 ratio 和 clip 防止一次更新过猛；
+4. entropy loss：鼓励策略保持探索，缓解 entropy collapse。
 """
 
 import numpy as np
@@ -54,6 +62,13 @@ class FixedKLController:
 
 
 class EntController:
+    """自适应熵系数控制器。
+
+    Skywork-OR1 技术报告强调过熵坍塌问题：RL 训练中模型可能过早变得确定，
+    采样多样性下降，后续探索能力变差。这个控制器的思路很直接：
+    当前 entropy 低于目标值时，增大 entropy coefficient；否则减小。
+    """
+
     def __init__(self, init_ent_coef, max_ent_coef, min_ent_coef, delta_ent_coef, target_ent, use_adapt_ent):
         self.value = init_ent_coef
         self.max_value = max_ent_coef
@@ -134,14 +149,28 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    index: torch.Tensor,
                                    epsilon: float = 1e-6):
     """
-    Compute advantage for GRPO, operating only on Outcome reward 
+    Compute advantage for GRPO, operating only on Outcome reward
     (with only one scalar reward for each response).
+
+    中文解释：
+    GRPO 不训练单独的 value/critic 模型，而是用“同一个 prompt 的多条回答”构造 baseline。
+
+    假设同一个题目采样了 16 条回答，verifier 给出 0/1 奖励：
+        [1, 0, 0, 1, ...]
+    GRPO 会在这 16 条内部计算均值和标准差，然后把每条回答的奖励标准化：
+        advantage = (reward - group_mean) / group_std
+
+    这代表：
+    - 比同题平均水平好的回答，advantage 为正，训练会提高它的概率；
+    - 比同题平均水平差的回答，advantage 为负，训练会压低它的概率；
+    - 如果同题全对或全错，std 很小/无区分度，所以 ray_trainer.py 里会做 rejection sampling。
+
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape: (bs, response_length)
         eos_mask: `(torch.Tensor)`
             shape: (bs, response_length)
-    
+
     Returns:
         advantages: `(torch.Tensor)`
             shape: (bs, response_length)
@@ -158,9 +187,12 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
+            # index/uid 标识“这条回答来自哪个原始 prompt”。
+            # rollout.n > 1 时，同一个 uid 会对应多条采样回答。
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
+                # 只有一条回答时无法做组内比较，退化成均值 0、标准差 1。
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
@@ -170,6 +202,8 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
             scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+        # outcome reward 原本只在序列最后一个 token 上有值。
+        # 这里把同一个标量 advantage 复制到回答的所有有效 token 上，供 token-level policy loss 使用。
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
 
     return scores, scores
@@ -266,6 +300,11 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
         pg_clipfrac: (float)
             a float number indicating the fraction of policy gradient loss being clipped
 
+    中文解释：
+    PPO 不是直接最大化 advantage * log_prob，而是看新旧策略概率比：
+        ratio = exp(new_log_prob - old_log_prob)
+    如果 ratio 偏离 1 太远，说明策略一步更新太猛，于是用 cliprange 截断。
+    这能让 RL 更新更稳定，避免模型在少量高奖励样本上过度漂移。
     """
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
@@ -291,6 +330,9 @@ def compute_entropy_loss(logits, eos_mask):
     Returns:
         entropy: a scalar torch.Tensor
 
+    中文解释：
+    entropy 越高，说明模型在候选 token 上越不确定、探索越强。
+    Skywork 脚本里的 adaptive_entropy 会根据当前 entropy 动态调节这个 loss 的权重。
     """
     # compute entropy
     entropy = verl_F.entropy_from_logits(logits)  # (bs, response_len)
@@ -334,6 +376,10 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
 
     Returns:
 
+    中文解释：
+    KL penalty 用来限制当前策略相对参考策略的漂移。
+    在后训练中，如果只追求 verifier 奖励，模型可能学会奇怪格式或投机行为；
+    KL 约束可以保留基座模型的语言能力和基本分布。
     """
     if kl_penalty == "kl":
         return logprob - ref_logprob

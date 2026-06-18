@@ -29,6 +29,13 @@ import verl.utils.torch_functional as verl_F
 
 
 def collate_fn(data_list: list[dict]) -> dict:
+    """把 Dataset 返回的多条样本拼成一个 batch。
+
+    中文解释：
+    - Tensor 字段，例如 input_ids、attention_mask、position_ids，会 stack 成张量；
+    - 非 Tensor 字段，例如 reward_model、ability、extra_info，会保留为 object 数组。
+    这很重要，因为 reward manager 后面需要读取 ground_truth / test_cases 等原始 Python 对象。
+    """
     tensors = {}
     non_tensors = {}
 
@@ -58,6 +65,15 @@ def collate_fn(data_list: list[dict]) -> dict:
 class RLHFDataset(Dataset):
     """
     We assume the dataset contains a column that contains prompts and other information
+
+    中文学习提示：
+    这是训练和验证数据进入模型前的最后一站。
+    它负责：
+    1. 读取 .pkl 或 .parquet；
+    2. 对 prompt 应用 tokenizer.chat_template；
+    3. 截断/过滤过长 prompt；
+    4. 输出 input_ids、attention_mask、position_ids；
+    5. 保留 reward_model.ground_truth 等非张量字段，供 verifier 打分。
     """
 
     def __init__(self,
@@ -102,6 +118,7 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.parquet_files:
             # read parquet files and cache
+            # Skywork 数据准备脚本输出的是 .pkl，AIME 验证集是 .parquet。
             if parquet_file.endswith(".pkl"):
                 dataframe = pd.read_pickle(parquet_file)
                 if not isinstance(dataframe, pd.core.frame.DataFrame):
@@ -114,6 +131,8 @@ class RLHFDataset(Dataset):
         print(f'original dataset len: {len(self.dataframe)}')
 
         # filter out too long prompts
+        # 这里只过滤 prompt 长度，不包含模型未来生成的 response。
+        # response 长度由 rollout.response_length / data.max_response_length 控制。
         tokenizer = self.tokenizer
         prompt_key = self.prompt_key
         self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
@@ -142,8 +161,13 @@ class RLHFDataset(Dataset):
 
         chat = row_dict.pop(self.prompt_key)
 
+        # prompt 在数据里通常已经是 OpenAI chat message 格式：
+        # [{"role": "user", "content": "..."}]
+        # apply_chat_template 会把它转成模型真正看到的字符串，并追加 assistant generation prompt。
         prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
 
+        # left_pad=True 是 decoder-only LLM 批量推理常见做法：
+        # 不同长度 prompt 左侧补 pad，右侧末尾位置对齐，方便继续生成。
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                          tokenizer=self.tokenizer,
                                                                          max_length=self.max_prompt_length,
@@ -162,6 +186,7 @@ class RLHFDataset(Dataset):
             row_dict['raw_prompt'] = chat.tolist()
 
         # add index for each prompt
+        # index 后续会被 ray_trainer 扩展成 uid，用来把同一 prompt 的多条采样回答分到同一组。
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
 
