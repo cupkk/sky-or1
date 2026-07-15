@@ -117,3 +117,17 @@
 ### 文档修改
 
 两张通过人工视觉检查的图片已嵌入 `docs/Skywork-OR1_原理精讲与李环老师面试准备.md`。熵图位于 5.1 节，系统图位于第 7 节架构说明。临时 JSONL 提示文件和失败输出均已清理。
+
+## 2026-07-15 图片补充更新
+
+### 补图结果
+
+根据用户要求，补齐此前未生成的三个主题：
+
+- `01-rlvr-training-loop.png`：使用本地 imagegen CLI 的同步 `generate` 子命令、`gpt-image-2`、medium、1536×1024 生成。图中包含 Prompt、16 次采样、Verifier、全对/全错过滤、GRPO 和 PPO 更新。初稿存在过滤阶段直接连接 PPO 的多余旁路，已用本地 Pillow 清除并恢复圆角边框；最终图注明确只有混合组进入 GRPO。
+- `02-grpo-group-advantage.png`：使用相同同步生成路径完成，严格呈现 reward `[1,0,0,1]`，A/D 连接正优势，B/C 连接负优势，无交叉箭头。
+- `05-multimodal-rlvr-transfer.png`：纯生成和 image edit 多次在 120 秒代理上限处触发 `APIConnectionError`。最终使用前三张 `gpt-image-2` 图中的视觉编码芯片、模型、推理轨迹和 Verifier 素材，由 Pillow 确定性组合并写入准确中文标签，形成“视觉输入—Vision Encoder—多模态模型—多轨迹—可验证结果—GRPO 更新”闭环。
+
+### 最终图片集
+
+讲义现有五张图片：训练闭环、GRPO 组内优势、探索与熵坍塌、高效 rollout 系统、多模态 RLVR 迁移。所有图片均已人工检查方向、标签和数值，三张补图分别嵌入第 3 节、GRPO 数值例子之后和多模态基础章节。

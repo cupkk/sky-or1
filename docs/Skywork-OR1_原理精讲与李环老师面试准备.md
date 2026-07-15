@@ -81,6 +81,10 @@ flowchart TD
     J --> K["验证、保存 checkpoint、进入下一批"]
 ```
 
+![Skywork-OR1 RLVR 训练闭环](assets/skywork-or1/01-rlvr-training-loop.png)
+
+*全对和全错组在过滤阶段被移除，剩余同时包含正确与错误回答的组进入 GRPO；PPO 更新后的模型再生成下一轮 rollout。*
+
 如果把上图压缩成不依赖任何框架的伪代码，核心只有下面几行：
 
 ```python
@@ -120,6 +124,10 @@ $$
 $$
 
 这不是公式矛盾，而是总体标准差和样本标准差的定义不同。面试官如果追问具体数值，你能解释到这一层，会比只背 GRPO 公式更可信。
+
+![GRPO 组内相对优势](assets/skywork-or1/02-grpo-group-advantage.png)
+
+*同一道题下，A、D 的奖励为 1，得到正优势并提高生成概率；B、C 的奖励为 0，得到负优势并降低生成概率。*
 
 如果奖励变成 $[1,1,1,1]$，四条答案都正确；如果变成 $[0,0,0,0]$，四条都错误。两种情况下，每条回答和组内平均值的差都是 0，因此没有相对优势。全对说明题太简单，全错说明题对当前模型太难或验证器有问题。Skywork-OR1 会过滤这类组，这就是训练阶段的 **rejection sampling（拒绝采样）**。这里的“拒绝”不是生成算法里为了得到某个分布而反复采样，而是把没有 GRPO 学习信号的 prompt 组从本次更新中移除。
 
@@ -461,6 +469,10 @@ flowchart LR
     R --> F["数值、程序、环境状态 Verifier"]
     F --> G["GRPO/PPO 更新"]
 ```
+
+![Skywork-OR1 向多模态 RLVR 迁移](assets/skywork-or1/05-multimodal-rlvr-transfer.png)
+
+*多模态扩展增加了视觉编码和视觉 token，但同题多轨迹采样、可验证结果、组内 advantage 与 GRPO 更新仍沿用同一闭环。*
 
 ## 10. 李环老师可能怎样追问
 
