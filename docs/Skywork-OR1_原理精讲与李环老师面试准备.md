@@ -215,6 +215,10 @@ $$
 
 低熵不天然是坏事。模型最终学会正确答案时，本来就应该更确定。真正的问题是 **premature entropy collapse（过早熵坍塌）**：模型还没找到足够好的策略，就快速收缩到少数固定推理套路。随后同题多次采样会越来越相似，新的正确路径变少，GRPO 的有效组也减少，模型逐渐失去学习可塑性。
 
+![健康探索与过早熵坍塌对比](assets/skywork-or1/03-entropy-exploration-collapse.png)
+
+*图中左侧保留多条可行推理路径，右侧策略过早集中到单一路径；底部控制器表示高温采样与自适应熵共同维持探索下限。*
+
 ### 5.2 自适应熵控制
 
 固定熵系数很难调。系数太小挡不住坍塌，太大又会让模型一直随机，甚至把概率分散到无意义 token 上。MAGIC 设定目标熵 $H_{\text{target}}$，根据当前熵动态调节系数：
@@ -327,6 +331,10 @@ flowchart LR
     A --> F["GRPO/PPO 计算"]
     F --> B
 ```
+
+![Skywork-OR1 高效 rollout 系统](assets/skywork-or1/04-efficient-rollout-system.png)
+
+*Ray 负责任务编排，FSDP actor 负责训练，vLLM 负责高吞吐 rollout；长 CoT 生成占论文所统计 32B 训练时间的 72.1%。*
 
 **Ray** 是分布式任务调度框架，负责创建远程 worker、分配 GPU、调用生成和更新任务。它像总调度室，本身不负责神经网络数学。
 

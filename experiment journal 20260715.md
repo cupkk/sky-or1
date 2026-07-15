@@ -100,3 +100,20 @@
 ### 下一位 Agent 交接
 
 后续不要继续扩展一整套新文档。应以 `docs/Skywork-OR1_原理精讲与李环老师面试准备.md` 为唯一面试主讲义，根据用户反馈做局部补充。模拟面试必须每次只问一个问题，先听用户回答，再指出缺失的因果关系、公式含义和系统权衡。
+
+## 2026-07-15 图片生成更新
+
+### 生成方式
+
+用户要求调用本地 imagegen 并使用 GPT Image 2。本轮按 `imagegen` skill 的显式模型控制路径，调用 `C:\Users\18103\.codex\skills\.system\imagegen\scripts\image_gen.py`，模型固定为 `gpt-image-2`。输出目标为讲义使用的 1536×1024 PNG 教学图，提示词采用 white-background scientific-educational infographic 风格，限制短中文标签、无额外段落、无 logo 和 watermark。
+
+### 生成结果
+
+- 保留 `docs/assets/skywork-or1/03-entropy-exploration-collapse.png`：高质量模式生成，中文标签准确，清楚对比健康多路径探索与过早熵坍塌，并展示高温采样和自适应熵控制。
+- 保留 `docs/assets/skywork-or1/04-efficient-rollout-system.png`：高质量模式生成，准确展示 Ray 调度、FSDP 训练、权重同步、vLLM Rollout、KV Cache、连续批处理、Verifier 和 `Rollout 72.1% 时间`。
+- 删除 `02-grpo-group-advantage.png`：奖励与文字虽然正确，但回答 D 的绿色连线靠近负优势区域，存在概念误导风险，不进入讲义和 Git。
+- RLVR 总闭环图和多模态迁移图在 high、medium、low 三档尝试中均出现图像 API connection error，没有生成可用文件。并发从 3 降到 1 后仍会发生，说明当前服务链路不稳定，不继续重复消耗。
+
+### 文档修改
+
+两张通过人工视觉检查的图片已嵌入 `docs/Skywork-OR1_原理精讲与李环老师面试准备.md`。熵图位于 5.1 节，系统图位于第 7 节架构说明。临时 JSONL 提示文件和失败输出均已清理。
